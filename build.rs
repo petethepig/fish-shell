@@ -18,8 +18,8 @@ fn main() {
 
     rsconf::set_env_value(
         "FISH_BUILD_DIR",
-        // This is set by CMake and might include symlinks. Since we want to compare this to
-        // the dir fish is executed in we need to canonicalize it.
+        // If set by CMake, this might include symlinks. Since we want to compare this to the
+        // dir fish is executed in we need to canonicalize it.
         canonicalize(fish_build_dir()).to_str().unwrap(),
     );
 
