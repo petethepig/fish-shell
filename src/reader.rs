@@ -5101,16 +5101,71 @@ impl<'a> Reader<'a> {
             )
         {
             // Autosuggestion is active and the search term has not changed, so we're good to go.
-            // Check for override function and call it if it exists.
-            let final_autosuggestion = if function::exists(L!("fish_autosuggestion_provider"), self.parser) {
-                self.call_autosuggestion_override(&result)
-            } else {
-                result.autosuggestion
-            };
-            
-            self.autosuggestion = final_autosuggestion;
+            // Accept the result immediately; provider overrides (if any) will be applied on next repaint
+            let default_text_for_provider = result.text.clone();
+            let search_prefix_len = result.search_string().len();
+            self.autosuggestion = result.autosuggestion;
             if self.is_repaint_needed(None) {
                 self.layout_and_repaint(L!("autosuggest"));
+            }
+
+            // Kick off a background request to the provider function which will update the
+            // suggestion asynchronously when it completes.
+            // Only consider provider override if we have a meaningful prefix (avoid blocking on first char)
+            if search_prefix_len >= 2 && function::exists(L!("fish_autosuggestion_provider"), self.parser) {
+                // Capture plain data for the background handler; avoid capturing &Parser.
+                let cmdline = self.command_line.text().to_owned();
+                let cursor = self.command_line.position();
+                let default_text = default_text_for_provider;
+                let performer = move || {
+                    assert_is_background_thread();
+                    (cmdline, cursor, default_text)
+                };
+                let canary = Rc::downgrade(&self.canary);
+                let completion = move |zelf: &mut Reader, payload: (WString, usize, WString)| {
+                    let (orig_cmdline, orig_cursor, default_text) = payload;
+                    if canary.upgrade().is_none() {
+                        return;
+                    }
+                    // Only proceed if the command line has not changed since we queued this.
+                    if zelf.command_line.text() != orig_cmdline {
+                        return;
+                    }
+                    // Build and execute the provider on the main thread using the parser.
+                    let mut fish_cmd = L!("fish_autosuggestion_provider ").to_owned();
+                    fish_cmd.push_utfstr(&escape_string(&orig_cmdline, EscapeStringStyle::Script(EscapeFlags::default())));
+                    fish_cmd.push(' ');
+                    fish_cmd.push_utfstr(&str2wcstring(orig_cursor.to_string().as_bytes()));
+                    fish_cmd.push(' ');
+                    fish_cmd.push_utfstr(&escape_string(&default_text, EscapeStringStyle::Script(EscapeFlags::default())));
+                    let mut outputs = vec![];
+                    // Run non-interactively and suppress TTY protocols, like prompts do, to avoid UI jitter.
+                    let _ni = zelf.parser.push_scope(|s| s.is_interactive = false);
+                    let mut scoped_tty = TtyHandoff::new(reader_save_screen_state);
+                    scoped_tty.disable_tty_protocols();
+                    let _ = exec_subshell(&fish_cmd, zelf.parser, Some(&mut outputs), false);
+                    let custom = WString::from_iter(outputs).trim().to_owned();
+                    if custom.is_empty() {
+                        return;
+                    }
+                    if zelf.can_autosuggest() && zelf.is_at_line_with_autosuggestion() {
+                        // Validate the custom suggestion still has the current line as a prefix.
+                        let range = zelf.autosuggestion.search_string_range.clone();
+                        let current_line_prefix = &orig_cmdline[range.clone()];
+                        if !string_prefixes_string_maybe_case_insensitive(
+                            zelf.autosuggestion.icase,
+                            current_line_prefix,
+                            &custom,
+                        ) {
+                            return;
+                        }
+                        zelf.autosuggestion.text = custom;
+                        if zelf.is_repaint_needed(None) {
+                            zelf.layout_and_repaint(L!("autosuggest-provider"));
+                        }
+                    }
+                };
+                debounce_autosuggestions().perform_with_completion(performer, completion);
             }
         }
     }
