@@ -4694,6 +4694,45 @@ impl<'a> Reader<'a> {
         output
     }
 
+    /// Call the fish_autosuggestion_provider function if it exists to override autosuggestions.
+    /// Returns a new Autosuggestion with the custom text, or the original if the function
+    /// doesn't exist or returns empty.
+    fn call_autosuggestion_override(&self, result: &AutosuggestionResult) -> Autosuggestion {
+        let cmd = &self.command_line;
+        let default_suggestion = &result.text;
+        
+        // Build the command to call the override function
+        // Pass: command_line, cursor_pos, default_suggestion
+        let mut fish_cmd = L!("fish_autosuggestion_provider ").to_owned();
+        fish_cmd.push_utfstr(&escape_string(cmd.text(), EscapeStringStyle::Script(EscapeFlags::default())));
+        fish_cmd.push(' ');
+        fish_cmd.push_utfstr(&str2wcstring(cmd.position().to_string().as_bytes()));
+        fish_cmd.push(' ');
+        fish_cmd.push_utfstr(&escape_string(default_suggestion, EscapeStringStyle::Script(EscapeFlags::default())));
+        
+        let mut output = vec![];
+        let _ = exec_subshell(&fish_cmd, self.parser, Some(&mut output), false);
+        
+        // If function returned empty or just whitespace, use default
+        let custom_suggestion = WString::from_iter(output);
+        if custom_suggestion.trim().is_empty() {
+            return Autosuggestion {
+                text: result.text.clone(),
+                search_string_range: result.search_string_range.clone(),
+                icase: result.icase,
+                is_whole_item_from_history: result.is_whole_item_from_history,
+            };
+        }
+        
+        // Build new Autosuggestion with custom text
+        Autosuggestion {
+            text: custom_suggestion.trim().to_owned(),
+            search_string_range: result.search_string_range.clone(),
+            icase: result.icase,
+            is_whole_item_from_history: false,
+        }
+    }
+
     /// Execute prompt commands based on the provided arguments. The output is inserted into prompt_buff.
     fn exec_prompt(&mut self, full_prompt: bool, final_prompt: bool) {
         // Suppress fish_trace while in the prompt.
@@ -5062,7 +5101,14 @@ impl<'a> Reader<'a> {
             )
         {
             // Autosuggestion is active and the search term has not changed, so we're good to go.
-            self.autosuggestion = result.autosuggestion;
+            // Check for override function and call it if it exists.
+            let final_autosuggestion = if function::exists(L!("fish_autosuggestion_provider"), self.parser) {
+                self.call_autosuggestion_override(&result)
+            } else {
+                result.autosuggestion
+            };
+            
+            self.autosuggestion = final_autosuggestion;
             if self.is_repaint_needed(None) {
                 self.layout_and_repaint(L!("autosuggest"));
             }
