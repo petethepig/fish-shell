@@ -44,7 +44,7 @@ use std::os::unix::ffi::OsStrExt;
 use crate::common::wcs2string;
 use std::rc::Rc;
 #[cfg(unix)]
-use libc::{kill as libc_kill, pid_t, SIGTERM};
+use libc::{kill as libc_kill, pid_t};
 #[cfg(target_has_atomic = "64")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
@@ -741,10 +741,13 @@ pub struct ReaderData {
     last_jump_direction: JumpDirection,
     last_jump_precision: JumpPrecision,
 
-    /// The text of the most recent asynchronous highlight and autosuggestion requests.
-    /// If these differs from the text of the command line, then we must kick off a new request.
+    /// The text of the most recent asynchronous highlight request.
+    /// If this differs from the text of the command line, then we must kick off a new request.
     in_flight_highlight_request: WString,
-    in_flight_autosuggest_request: WString,
+
+    /// Queue of in-flight autosuggestion requests. Each entry contains the command line text
+    /// that the request was made for, allowing us to identify stale requests.
+    autosuggest_request_queue: Vec<WString>,
 
     rls: Option<ReadlineLoopState>,
 }
@@ -1368,7 +1371,7 @@ impl ReaderData {
             last_jump_direction: JumpDirection::Forward,
             last_jump_precision: JumpPrecision::To,
             in_flight_highlight_request: Default::default(),
-            in_flight_autosuggest_request: Default::default(),
+            autosuggest_request_queue: Default::default(),
             rls: None,
         }))
     }
@@ -1435,6 +1438,11 @@ impl ReaderData {
             EditableLineTag::Commandline => {
                 // Update the gen count.
                 GENERATION.fetch_add(1, Ordering::Relaxed);
+                
+                // Clean up stale autosuggestion requests
+                let current_cmdline = self.command_line.text();
+                self.autosuggest_request_queue.retain(|queued_cmdline| queued_cmdline == &current_cmdline);
+                
                 let saved_autosuggestion = self.saved_autosuggestion.take();
                 use AutosuggestionUpdate::*;
                 match autosuggestion_update {
@@ -4723,9 +4731,9 @@ impl<'a> Reader<'a> {
         let mut output = vec![];
         let _ = exec_subshell(&fish_cmd, self.parser, Some(&mut output), false);
         
-        // If function returned empty or just whitespace, use default
+        // If function returned empty, use default
         let custom_suggestion = WString::from_iter(output);
-        if custom_suggestion.trim().is_empty() {
+        if custom_suggestion.is_empty() {
             return Autosuggestion {
                 text: result.text.clone(),
                 search_string_range: result.search_string_range.clone(),
@@ -4734,9 +4742,9 @@ impl<'a> Reader<'a> {
             };
         }
         
-        // Build new Autosuggestion with custom text
+        // Build new Autosuggestion with custom text (preserve whitespace)
         Autosuggestion {
-            text: custom_suggestion.trim().to_owned(),
+            text: custom_suggestion,
             search_string_range: result.search_string_range.clone(),
             icase: result.icase,
             is_whole_item_from_history: false,
@@ -5079,9 +5087,10 @@ impl<'a> Reader<'a> {
     // Called after an autosuggestion has been computed on a background thread.
     fn autosuggest_completed(&mut self, result: AutosuggestionResult) {
         assert_is_main_thread();
-        if result.command_line == self.data.in_flight_autosuggest_request {
-            self.data.in_flight_autosuggest_request.clear();
-        }
+        
+        // Remove this request from the queue
+        self.data.autosuggest_request_queue.retain(|cmdline| cmdline != &result.command_line);
+        
         if result.command_line != self.command_line.text() {
             // This autosuggestion is stale.
             return;
@@ -5154,6 +5163,8 @@ impl<'a> Reader<'a> {
             }
             // Also capture external provider path as a narrow string (if any), so we can spawn on bg thread.
             let provider_cmd_narrow: Option<Vec<u8>> = provider_cmd.as_ref().map(|w| wcs2string(w));
+            // Capture icase flag to prevent TOCTOU issues
+            let icase_flag = self.autosuggestion.icase;
             let performer = move || {
                 assert_is_background_thread();
                 if let Some(ref cmd_bytes) = provider_cmd_narrow {
@@ -5175,26 +5186,26 @@ impl<'a> Reader<'a> {
                             if let Ok(s) = String::from_utf8(output.stdout) {
                                 let mut lines: Vec<WString> = vec![];
                                 for line in s.lines() {
-                                    let trimmed = line.trim();
-                                    if !trimmed.is_empty() {
-                                        lines.push(str2wcstring(trimmed.as_bytes()));
+                                    // Preserve whitespace - don't trim
+                                    if !line.is_empty() {
+                                        lines.push(str2wcstring(line.as_bytes()));
                                     }
                                 }
                                 if !lines.is_empty() {
-                                    return (cmdline, cursor, default_text, Some(lines));
+                                    return (cmdline, cursor, default_text, icase_flag, Some(lines));
                                 }
                             }
                         }
                     }
                     // No suggestion from external provider
-                    return (cmdline, cursor, default_text, None);
+                    return (cmdline, cursor, default_text, icase_flag, None);
                 }
                 // No external provider configured; return payload with no suggestion.
-                (cmdline, cursor, default_text, None)
+                (cmdline, cursor, default_text, icase_flag, None)
             };
             let completion = move |zelf: &mut Reader,
-                                   payload: (WString, usize, WString, Option<Vec<WString>>)| {
-                let (orig_cmdline, orig_cursor, default_text, custom_lines_from_external) = payload;
+                                   payload: (WString, usize, WString, bool, Option<Vec<WString>>)| {
+                let (orig_cmdline, orig_cursor, default_text, icase_flag, custom_lines_from_external) = payload;
                 // Clear the in-flight key if the state advanced.
                 let cursor_key = str2wcstring(orig_cursor.to_string().as_bytes());
                 if zelf.data.in_flight_provider_request.starts_with(&orig_cmdline) {
@@ -5206,10 +5217,6 @@ impl<'a> Reader<'a> {
                     if expected == zelf.data.in_flight_provider_request {
                         zelf.data.in_flight_provider_request.clear();
                     }
-                }
-                // Only proceed if the command line has not changed since we queued this.
-                if zelf.command_line.text() != orig_cmdline {
-                    return;
                 }
                 // If we already have results from external provider, collect them; otherwise, optionally call fish function.
                 let mut candidate_lines: Vec<WString> = custom_lines_from_external.unwrap_or_default();
@@ -5234,9 +5241,9 @@ impl<'a> Reader<'a> {
                     scoped_tty.disable_tty_protocols();
                     let _ = exec_subshell(&fish_cmd, zelf.parser, Some(&mut outputs), false);
                     for line in outputs {
-                        let t = line.trim();
-                        if !t.is_empty() {
-                            candidate_lines.push(t.to_owned());
+                        // Preserve whitespace - don't trim
+                        if !line.is_empty() {
+                            candidate_lines.push(line.to_owned());
                         }
                     }
                 }
@@ -5246,12 +5253,18 @@ impl<'a> Reader<'a> {
                 if zelf.can_autosuggest() && zelf.is_at_line_with_autosuggestion() {
                     // Choose the first candidate that extends the current prefix.
                     let range = zelf.autosuggestion.search_string_range.clone();
+                    
+                    // Validate range bounds to prevent panics
+                    if range.end > orig_cmdline.len() {
+                        return;
+                    }
+                    
                     let current_line_prefix = &orig_cmdline[range.clone()];
                     let mut chosen: Option<WString> = None;
                     for cand in candidate_lines {
                         if cand.len() > current_line_prefix.len()
                             && string_prefixes_string_maybe_case_insensitive(
-                                zelf.autosuggestion.icase,
+                                icase_flag,
                                 current_line_prefix,
                                 &cand,
                             )
@@ -5280,7 +5293,7 @@ impl<'a> Reader<'a> {
     fn update_autosuggestion(&mut self) {
         // If we can't autosuggest, just clear it.
         if !self.can_autosuggest() {
-            self.data.in_flight_autosuggest_request.clear();
+            self.data.autosuggest_request_queue.clear();
             self.data.autosuggestion.clear();
             return;
         }
@@ -5296,18 +5309,16 @@ impl<'a> Reader<'a> {
             return;
         }
 
-        // Do nothing if we've already kicked off this autosuggest request.
-        if el.text() == self.in_flight_autosuggest_request {
-            return;
-        }
-        self.data.in_flight_autosuggest_request = el.text().to_owned();
+        // Always queue a new autosuggestion request
+        let cmdline_text = el.text().to_owned();
+        self.data.autosuggest_request_queue.push(cmdline_text.clone());
 
         // Clear the autosuggestion and kick it off in the background.
         FLOG!(reader_render, "Autosuggesting");
         self.data.autosuggestion.clear();
         let performer = get_autosuggestion_performer(
             self.parser,
-            el.text().to_owned(),
+            cmdline_text,
             el.position(),
             self.history.clone(),
         );
