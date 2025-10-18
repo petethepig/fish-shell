@@ -38,7 +38,13 @@ use std::ops::Range;
 use std::os::fd::BorrowedFd;
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
+use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+use crate::common::wcs2string;
 use std::rc::Rc;
+#[cfg(unix)]
+use libc::{kill as libc_kill, pid_t, SIGTERM};
 #[cfg(target_has_atomic = "64")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
@@ -140,7 +146,7 @@ use crate::text_face::parse_text_face;
 use crate::text_face::TextFace;
 use crate::threads::{
     assert_is_background_thread, assert_is_main_thread, iothread_service_main_with_timeout,
-    Debounce,
+    iothread_perform, post_main, Debounce,
 };
 use crate::tokenizer::quote_end;
 use crate::tokenizer::variable_assignment_equals_pos;
@@ -709,6 +715,9 @@ pub struct ReaderData {
     mode_prompt_buff: WString,
     /// The output of the last evaluation of the right prompt command.
     right_prompt_buff: WString,
+
+    /// Last provider request key (commandline + cursor) to avoid rescheduling on repaint.
+    in_flight_provider_request: WString,
 
     /// When navigating the pager, we modify the command line.
     /// This is the saved command line before modification.
@@ -1348,6 +1357,7 @@ impl ReaderData {
             left_prompt_buff: Default::default(),
             mode_prompt_buff: Default::default(),
             right_prompt_buff: Default::default(),
+            in_flight_provider_request: Default::default(),
             cycle_command_line: Default::default(),
             cycle_cursor_pos: Default::default(),
             exit_loop_requested: Default::default(),
@@ -5088,6 +5098,10 @@ impl<'a> Reader<'a> {
                 loaded_new = true;
             }
         }
+        // Prepare defaults for provider regardless of suggestion presence.
+        let default_text_for_provider = result.text.clone();
+        let search_prefix_len = result.search_string().len();
+
         if loaded_new {
             // We loaded new completions for this command.
             // Re-do our autosuggestion.
@@ -5102,71 +5116,164 @@ impl<'a> Reader<'a> {
         {
             // Autosuggestion is active and the search term has not changed, so we're good to go.
             // Accept the result immediately; provider overrides (if any) will be applied on next repaint
-            let default_text_for_provider = result.text.clone();
-            let search_prefix_len = result.search_string().len();
             self.autosuggestion = result.autosuggestion;
             if self.is_repaint_needed(None) {
                 self.layout_and_repaint(L!("autosuggest"));
             }
-
-            // Kick off a background request to the provider function which will update the
-            // suggestion asynchronously when it completes.
-            // Only consider provider override if we have a meaningful prefix (avoid blocking on first char)
-            if search_prefix_len >= 2 && function::exists(L!("fish_autosuggestion_provider"), self.parser) {
-                // Capture plain data for the background handler; avoid capturing &Parser.
-                let cmdline = self.command_line.text().to_owned();
-                let cursor = self.command_line.position();
-                let default_text = default_text_for_provider;
-                let performer = move || {
-                    assert_is_background_thread();
-                    (cmdline, cursor, default_text)
-                };
-                let canary = Rc::downgrade(&self.canary);
-                let completion = move |zelf: &mut Reader, payload: (WString, usize, WString)| {
-                    let (orig_cmdline, orig_cursor, default_text) = payload;
-                    if canary.upgrade().is_none() {
-                        return;
+        }
+        // Also invoke the provider even if there is no default suggestion (e.g. after a trailing space).
+        let provider_cmd = self
+            .parser
+            .vars()
+            .get(L!("FISH_AUTOSUGGESTION_PROVIDER_CMD"))
+            .map(|v| v.as_string());
+        if self.can_autosuggest()
+            && search_prefix_len >= 1
+            && (function::exists(L!("fish_autosuggestion_provider"), self.parser) || provider_cmd.is_some())
+        {
+            // Capture plain data for the background handler; avoid capturing &Parser.
+            let cmdline = self.command_line.text().to_owned();
+            let cursor = self.command_line.position();
+            // Gate repeated schedules for identical cmdline+cursor.
+            let mut key = cmdline.clone();
+            key.push(' ');
+            key.push_utfstr(&str2wcstring(cursor.to_string().as_bytes()));
+            if key == self.data.in_flight_provider_request {
+                // Already scheduled for this state; skip to avoid loops.
+                return;
+            }
+            self.data.in_flight_provider_request = key;
+            let default_text = default_text_for_provider;
+            // Skip trailing-space-without-default to avoid loops like "npm run ".
+            let last_is_space = cmdline
+                .as_char_slice()
+                .last()
+                .is_some_and(|c| c.is_whitespace());
+            if last_is_space && default_text.is_empty() {
+                return;
+            }
+            // Also capture external provider path as a narrow string (if any), so we can spawn on bg thread.
+            let provider_cmd_narrow: Option<Vec<u8>> = provider_cmd.as_ref().map(|w| wcs2string(w));
+            let performer = move || {
+                assert_is_background_thread();
+                if let Some(ref cmd_bytes) = provider_cmd_narrow {
+                    // Run external provider fully in the background thread.
+                    let prog = std::ffi::OsStr::from_bytes(cmd_bytes);
+                    let arg1 = String::from_utf8_lossy(&wcs2string(&cmdline)).into_owned();
+                    let arg2 = cursor.to_string();
+                    let arg3 = String::from_utf8_lossy(&wcs2string(&default_text)).into_owned();
+                    if let Ok(child) = Command::new(prog)
+                        .arg(arg1)
+                        .arg(arg2)
+                        .arg(arg3)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::null())
+                        .spawn()
+                    {
+                        if let Ok(output) = child.wait_with_output() {
+                            if let Ok(s) = String::from_utf8(output.stdout) {
+                                let mut lines: Vec<WString> = vec![];
+                                for line in s.lines() {
+                                    let trimmed = line.trim();
+                                    if !trimmed.is_empty() {
+                                        lines.push(str2wcstring(trimmed.as_bytes()));
+                                    }
+                                }
+                                if !lines.is_empty() {
+                                    return (cmdline, cursor, default_text, Some(lines));
+                                }
+                            }
+                        }
                     }
-                    // Only proceed if the command line has not changed since we queued this.
-                    if zelf.command_line.text() != orig_cmdline {
-                        return;
+                    // No suggestion from external provider
+                    return (cmdline, cursor, default_text, None);
+                }
+                // No external provider configured; return payload with no suggestion.
+                (cmdline, cursor, default_text, None)
+            };
+            let completion = move |zelf: &mut Reader,
+                                   payload: (WString, usize, WString, Option<Vec<WString>>)| {
+                let (orig_cmdline, orig_cursor, default_text, custom_lines_from_external) = payload;
+                // Clear the in-flight key if the state advanced.
+                let cursor_key = str2wcstring(orig_cursor.to_string().as_bytes());
+                if zelf.data.in_flight_provider_request.starts_with(&orig_cmdline) {
+                    // Clear if cursor also matches by suffix equality (after a space separator).
+                    // in_flight key is "<cmdline> <cursor>".
+                    let mut expected = orig_cmdline.clone();
+                    expected.push(' ');
+                    expected.push_utfstr(&cursor_key);
+                    if expected == zelf.data.in_flight_provider_request {
+                        zelf.data.in_flight_provider_request.clear();
                     }
-                    // Build and execute the provider on the main thread using the parser.
+                }
+                // Only proceed if the command line has not changed since we queued this.
+                if zelf.command_line.text() != orig_cmdline {
+                    return;
+                }
+                // If we already have results from external provider, collect them; otherwise, optionally call fish function.
+                let mut candidate_lines: Vec<WString> = custom_lines_from_external.unwrap_or_default();
+                if candidate_lines.is_empty() && provider_cmd.is_none() {
+                    // Fallback to fish function provider on main thread using the parser.
                     let mut fish_cmd = L!("fish_autosuggestion_provider ").to_owned();
-                    fish_cmd.push_utfstr(&escape_string(&orig_cmdline, EscapeStringStyle::Script(EscapeFlags::default())));
+                    fish_cmd.push_utfstr(&escape_string(
+                        &orig_cmdline,
+                        EscapeStringStyle::Script(EscapeFlags::default()),
+                    ));
                     fish_cmd.push(' ');
                     fish_cmd.push_utfstr(&str2wcstring(orig_cursor.to_string().as_bytes()));
                     fish_cmd.push(' ');
-                    fish_cmd.push_utfstr(&escape_string(&default_text, EscapeStringStyle::Script(EscapeFlags::default())));
+                    fish_cmd.push_utfstr(&escape_string(
+                        &default_text,
+                        EscapeStringStyle::Script(EscapeFlags::default()),
+                    ));
                     let mut outputs = vec![];
                     // Run non-interactively and suppress TTY protocols, like prompts do, to avoid UI jitter.
                     let _ni = zelf.parser.push_scope(|s| s.is_interactive = false);
                     let mut scoped_tty = TtyHandoff::new(reader_save_screen_state);
                     scoped_tty.disable_tty_protocols();
                     let _ = exec_subshell(&fish_cmd, zelf.parser, Some(&mut outputs), false);
-                    let custom = WString::from_iter(outputs).trim().to_owned();
-                    if custom.is_empty() {
-                        return;
-                    }
-                    if zelf.can_autosuggest() && zelf.is_at_line_with_autosuggestion() {
-                        // Validate the custom suggestion still has the current line as a prefix.
-                        let range = zelf.autosuggestion.search_string_range.clone();
-                        let current_line_prefix = &orig_cmdline[range.clone()];
-                        if !string_prefixes_string_maybe_case_insensitive(
-                            zelf.autosuggestion.icase,
-                            current_line_prefix,
-                            &custom,
-                        ) {
-                            return;
-                        }
-                        zelf.autosuggestion.text = custom;
-                        if zelf.is_repaint_needed(None) {
-                            zelf.layout_and_repaint(L!("autosuggest-provider"));
+                    for line in outputs {
+                        let t = line.trim();
+                        if !t.is_empty() {
+                            candidate_lines.push(t.to_owned());
                         }
                     }
-                };
-                debounce_autosuggestions().perform_with_completion(performer, completion);
-            }
+                }
+                if candidate_lines.is_empty() {
+                    return;
+                }
+                if zelf.can_autosuggest() && zelf.is_at_line_with_autosuggestion() {
+                    // Choose the first candidate that extends the current prefix.
+                    let range = zelf.autosuggestion.search_string_range.clone();
+                    let current_line_prefix = &orig_cmdline[range.clone()];
+                    let mut chosen: Option<WString> = None;
+                    for cand in candidate_lines {
+                        if cand.len() > current_line_prefix.len()
+                            && string_prefixes_string_maybe_case_insensitive(
+                                zelf.autosuggestion.icase,
+                                current_line_prefix,
+                                &cand,
+                            )
+                        {
+                            chosen = Some(cand);
+                            break;
+                        }
+                    }
+                    let Some(custom) = chosen else { return; };
+                    zelf.autosuggestion.text = custom;
+                    // Clear in-flight key now that we applied a result
+                    zelf.data.in_flight_provider_request.clear();
+                    if zelf.is_repaint_needed(None) {
+                        zelf.layout_and_repaint(L!("autosuggest-provider"));
+                    }
+                }
+            };
+            // Perform provider immediately; enqueue completion to main thread when done.
+            iothread_perform(move || {
+                let payload = performer();
+                post_main(move |zelf| completion(zelf, payload));
+            });
         }
     }
 

@@ -519,6 +519,13 @@ pub fn iothread_service_main(ctx: &mut Reader) {
     }
 }
 
+/// Post a callback to run on the main thread, executed during iothread_service_main.
+pub fn post_main(callback: impl FnOnce(&mut Reader) + 'static) {
+    let cb: DebounceCallback = ForceSend(Box::new(callback));
+    MAIN_THREAD_QUEUE.lock().expect("Mutex poisoned!").push(cb);
+    NOTIFY_SIGNALLER.post();
+}
+
 /// Does nasty polling via select(), only used for testing.
 #[cfg(test)]
 pub(crate) fn iothread_drain_all(ctx: &mut Reader) {
